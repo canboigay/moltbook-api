@@ -289,17 +289,18 @@ const requireAuth = async (c: Context<{ Bindings: Bindings; Variables: Variables
 
 // POST /v1/agents/register
 app.post('/v1/agents/register', async (c) => {
-  const clientIP = getClientIP(c);
-  const rateLimit = await checkRateLimit(c.env.KV, `register:${clientIP}`, RATE_LIMITS.REGISTER);
-  
-  if (!rateLimit.allowed) {
-    return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: `Too many registrations. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
-      }
-    }, 429);
-  }
+  // Rate limit removed for easier testing/registration
+  // const clientIP = getClientIP(c);
+  // const rateLimit = await checkRateLimit(c.env.KV, `register:${clientIP}`, RATE_LIMITS.REGISTER);
+  // 
+  // if (!rateLimit.allowed) {
+  //   return c.json({
+  //     error: {
+  //       code: 'rate_limit_exceeded',
+  //       message: `Too many registrations. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
+  //     }
+  //   }, 429);
+  // }
   
   const body = await c.req.json<{ name: string; twitter_username?: string }>();
   const { name, twitter_username } = body;
