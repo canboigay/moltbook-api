@@ -770,12 +770,13 @@ app.get('/v1/agents', async (c) => {
   try {
     const clientIP = getClientIP(c);
     
-    const rateLimit = await checkRateLimit(c.env.KV, `read:public:${clientIP}`, RATE_LIMITS.READ);
-    if (!rateLimit.allowed) {
-      return c.json({
-        error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
-      }, 429);
-    }
+    // Skip rate limiting for now to debug
+    // const rateLimit = await checkRateLimit(c.env.KV, `read:public:${clientIP}`, RATE_LIMITS.READ);
+    // if (!rateLimit.allowed) {
+    //   return c.json({
+    //     error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
+    //   }, 429);
+    // }
     
     const limit = Math.min(parseInt(c.req.query('limit') || '100'), 500);
     const offset = parseInt(c.req.query('offset') || '0');
