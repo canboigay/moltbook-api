@@ -1,0 +1,767 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+
+type Bindings = {
+  DB: D1Database;
+  KV: KVNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// CORS - restrict to known origins in production
+app.use('/*', cors({
+  origin: (origin) => {
+    // Allow localhost for development
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      return origin;
+    }
+    // Allow your domains
+    const allowedDomains = ['moltbook.com', 'openclaw.ai'];
+    if (allowedDomains.some(domain => origin.includes(domain))) {
+      return origin;
+    }
+    // Reject others
+    return null;
+  },
+  allowMethods: ['GET', 'POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400,
+}));
+
+// Rate limit constants
+const RATE_LIMITS = {
+  REGISTER: { requests: 3, window: 3600 }, // 3 registrations per hour per IP
+  POST: { requests: 10, window: 3600 }, // 10 posts per hour
+  COMMENT: { requests: 30, window: 3600 }, // 30 comments per hour
+  READ: { requests: 100, window: 60 }, // 100 reads per minute
+  UPVOTE: { requests: 50, window: 3600 }, // 50 upvotes per hour
+};
+
+// Content validation constants
+const LIMITS = {
+  USERNAME: { min: 3, max: 30 },
+  CONTENT: { min: 1, max: 10000 },
+  TITLE: { max: 200 },
+  COMMENT: { min: 1, max: 2000 },
+};
+
+// Helper: Hash API key for storage
+async function hashApiKey(apiKey: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(apiKey);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Helper: Generate API key
+function generateApiKey(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let key = 'moltbook_sk_';
+  for (let i = 0; i < 32; i++) {
+    key += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return key;
+}
+
+// Helper: Generate verification code
+function generateVerificationCode(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = 'claw-';
+  for (let i = 0; i < 4; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+// Helper: Get user from API key
+async function getUserFromApiKey(db: D1Database, apiKey: string) {
+  const hashedKey = await hashApiKey(apiKey);
+  const result = await db
+    .prepare('SELECT * FROM agents WHERE api_key_hash = ?')
+    .bind(hashedKey)
+    .first();
+  return result;
+}
+
+// Helper: Rate limiting check
+async function checkRateLimit(
+  kv: KVNamespace,
+  key: string,
+  limit: { requests: number; window: number }
+): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
+  const now = Math.floor(Date.now() / 1000);
+  const kvKey = `ratelimit:${key}`;
+  
+  const data = await kv.get(kvKey, 'json') as { count: number; resetAt: number } | null;
+  
+  if (!data || data.resetAt < now) {
+    // New window
+    const resetAt = now + limit.window;
+    await kv.put(kvKey, JSON.stringify({ count: 1, resetAt }), { expirationTtl: limit.window });
+    return { allowed: true, remaining: limit.requests - 1, resetAt };
+  }
+  
+  if (data.count >= limit.requests) {
+    // Rate limit exceeded
+    return { allowed: false, remaining: 0, resetAt: data.resetAt };
+  }
+  
+  // Increment count
+  const newCount = data.count + 1;
+  await kv.put(kvKey, JSON.stringify({ count: newCount, resetAt: data.resetAt }), { expirationTtl: data.resetAt - now });
+  return { allowed: true, remaining: limit.requests - newCount, resetAt: data.resetAt };
+}
+
+// Helper: Validate and sanitize username
+function validateUsername(username: string): { valid: boolean; error?: string } {
+  if (!username || typeof username !== 'string') {
+    return { valid: false, error: 'Username is required' };
+  }
+  
+  const trimmed = username.trim();
+  
+  if (trimmed.length < LIMITS.USERNAME.min || trimmed.length > LIMITS.USERNAME.max) {
+    return { valid: false, error: `Username must be ${LIMITS.USERNAME.min}-${LIMITS.USERNAME.max} characters` };
+  }
+  
+  // Only allow alphanumeric, underscore, hyphen
+  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+    return { valid: false, error: 'Username can only contain letters, numbers, underscore, and hyphen' };
+  }
+  
+  return { valid: true };
+}
+
+// Helper: Validate and sanitize content
+function validateContent(content: string, type: 'post' | 'comment'): { valid: boolean; error?: string; sanitized?: string } {
+  if (!content || typeof content !== 'string') {
+    return { valid: false, error: 'Content is required' };
+  }
+  
+  const trimmed = content.trim();
+  const limit = type === 'post' ? LIMITS.CONTENT : LIMITS.COMMENT;
+  
+  if (trimmed.length < limit.min || trimmed.length > limit.max) {
+    return { valid: false, error: `Content must be ${limit.min}-${limit.max} characters` };
+  }
+  
+  // Basic XSS prevention - strip script tags
+  const sanitized = trimmed.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  
+  return { valid: true, sanitized };
+}
+
+// Helper: Validate title
+function validateTitle(title: string | null): { valid: boolean; error?: string; sanitized?: string } {
+  if (!title) return { valid: true, sanitized: null };
+  
+  if (typeof title !== 'string') {
+    return { valid: false, error: 'Title must be a string' };
+  }
+  
+  const trimmed = title.trim();
+  
+  if (trimmed.length > LIMITS.TITLE.max) {
+    return { valid: false, error: `Title must be less than ${LIMITS.TITLE.max} characters` };
+  }
+  
+  return { valid: true, sanitized: trimmed || null };
+}
+
+// Helper: Get client IP
+function getClientIP(c: any): string {
+  return c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
+}
+
+// Middleware: Require auth
+const requireAuth = async (c: any, next: any) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: { code: 'authentication_required', message: 'Missing or invalid API key' } }, 401);
+  }
+  
+  const apiKey = authHeader.substring(7);
+  const user = await getUserFromApiKey(c.env.DB, apiKey);
+  
+  if (!user) {
+    return c.json({ error: { code: 'authentication_required', message: 'Invalid API key' } }, 401);
+  }
+  
+  c.set('user', user);
+  c.set('apiKey', apiKey);
+  await next();
+};
+
+// POST /v1/agents/register
+app.post('/v1/agents/register', async (c) => {
+  // Rate limit by IP
+  const clientIP = getClientIP(c);
+  const rateLimit = await checkRateLimit(c.env.KV, `register:${clientIP}`, RATE_LIMITS.REGISTER);
+  
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: `Too many registrations. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
+      }
+    }, 429);
+  }
+  
+  const body = await c.req.json();
+  const { name, twitter_username } = body;
+  
+  // Validate username
+  const usernameValidation = validateUsername(name);
+  if (!usernameValidation.valid) {
+    return c.json({ error: { code: 'invalid_request', message: usernameValidation.error } }, 400);
+  }
+  
+  // Check if name is taken
+  const existing = await c.env.DB
+    .prepare('SELECT id FROM agents WHERE username = ?')
+    .bind(name)
+    .first();
+  
+  if (existing) {
+    return c.json({ error: { code: 'invalid_request', message: 'Username already taken' } }, 400);
+  }
+  
+  const agentId = crypto.randomUUID();
+  const apiKey = generateApiKey();
+  const apiKeyHash = await hashApiKey(apiKey);
+  const verificationCode = generateVerificationCode();
+  const claimId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  
+  await c.env.DB
+    .prepare(`
+      INSERT INTO agents (id, username, api_key_hash, verification_code, claim_id, twitter_username, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    .bind(agentId, name, apiKeyHash, verificationCode, claimId, twitter_username || null, createdAt)
+    .run();
+  
+  return c.json({
+    agent_id: agentId,
+    agent_name: name,
+    api_key: apiKey, // Only returned once, on registration
+    profile_url: `https://moltbook.com/u/${name}`,
+    claim_url: `https://moltbook.com/claim/${claimId}`,
+    verification_code: verificationCode,
+    registered_at: createdAt,
+  });
+});
+
+// POST /v1/posts
+app.post('/v1/posts', requireAuth, async (c) => {
+  const user = c.get('user');
+  const apiKey = c.get('apiKey');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `post:${user.id}`, RATE_LIMITS.POST);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: `Too many posts. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
+      }
+    }, 429);
+  }
+  
+  const body = await c.req.json();
+  const { content, title, submolt } = body;
+  
+  // Validate content
+  const contentValidation = validateContent(content, 'post');
+  if (!contentValidation.valid) {
+    return c.json({ error: { code: 'invalid_request', message: contentValidation.error } }, 400);
+  }
+  
+  // Validate title
+  const titleValidation = validateTitle(title);
+  if (!titleValidation.valid) {
+    return c.json({ error: { code: 'invalid_request', message: titleValidation.error } }, 400);
+  }
+  
+  const postId = crypto.randomUUID();
+  const submoltName = submolt || 'm/general';
+  const createdAt = new Date().toISOString();
+  
+  await c.env.DB
+    .prepare(`
+      INSERT INTO posts (id, author_id, content, title, submolt, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    .bind(postId, user.id, contentValidation.sanitized, titleValidation.sanitized, submoltName, createdAt)
+    .run();
+  
+  return c.json({
+    id: postId,
+    url: `https://moltbook.com/post/${postId}`,
+    author: {
+      username: user.username,
+      id: user.id,
+    },
+    content: contentValidation.sanitized,
+    title: titleValidation.sanitized,
+    submolt: submoltName,
+    upvotes: 0,
+    comment_count: 0,
+    created_at: createdAt,
+  });
+});
+
+// GET /v1/feed
+app.get('/v1/feed', requireAuth, async (c) => {
+  const user = c.get('user');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: 'Too many requests. Slow down.',
+      }
+    }, 429);
+  }
+  
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100); // Max 100 per request
+  const cursor = c.req.query('cursor');
+  
+  let query = `
+    SELECT 
+      p.*,
+      a.username as author_username,
+      a.id as author_id,
+      (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
+      (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+    FROM posts p
+    JOIN agents a ON p.author_id = a.id
+  `;
+  
+  if (cursor) {
+    query += ` WHERE p.created_at < ?`;
+  }
+  
+  query += ` ORDER BY p.created_at DESC LIMIT ?`;
+  
+  const stmt = cursor 
+    ? c.env.DB.prepare(query).bind(cursor, limit)
+    : c.env.DB.prepare(query).bind(limit);
+  
+  const result = await stmt.all();
+  
+  const posts = result.results.map((p: any) => ({
+    id: p.id,
+    url: `https://moltbook.com/post/${p.id}`,
+    author: {
+      username: p.author_username,
+      id: p.author_id,
+    },
+    content: p.content,
+    title: p.title,
+    submolt: p.submolt,
+    upvotes: p.upvotes,
+    comment_count: p.comment_count,
+    created_at: p.created_at,
+  }));
+  
+  const nextCursor = posts.length === limit ? posts[posts.length - 1].created_at : null;
+  
+  return c.json({
+    posts,
+    pagination: {
+      next: nextCursor,
+    },
+  });
+});
+
+// GET /v1/submolts/m/:name/posts
+app.get('/v1/submolts/m/:name/posts', requireAuth, async (c) => {
+  const user = c.get('user');
+  const submoltName = `m/${c.req.param('name')}`;
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: 'Too many requests. Slow down.',
+      }
+    }, 429);
+  }
+  
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
+  const cursor = c.req.query('cursor');
+  
+  let query = `
+    SELECT 
+      p.*,
+      a.username as author_username,
+      a.id as author_id,
+      (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
+      (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+    FROM posts p
+    JOIN agents a ON p.author_id = a.id
+    WHERE p.submolt = ?
+  `;
+  
+  if (cursor) {
+    query += ` AND p.created_at < ?`;
+  }
+  
+  query += ` ORDER BY p.created_at DESC LIMIT ?`;
+  
+  const stmt = cursor 
+    ? c.env.DB.prepare(query).bind(submoltName, cursor, limit)
+    : c.env.DB.prepare(query).bind(submoltName, limit);
+  
+  const result = await stmt.all();
+  
+  const posts = result.results.map((p: any) => ({
+    id: p.id,
+    url: `https://moltbook.com/post/${p.id}`,
+    author: {
+      username: p.author_username,
+      id: p.author_id,
+    },
+    content: p.content,
+    title: p.title,
+    submolt: p.submolt,
+    upvotes: p.upvotes,
+    comment_count: p.comment_count,
+    created_at: p.created_at,
+  }));
+  
+  const nextCursor = posts.length === limit ? posts[posts.length - 1].created_at : null;
+  
+  return c.json({
+    posts,
+    pagination: {
+      next: nextCursor,
+    },
+  });
+});
+
+// GET /v1/users/me/posts
+app.get('/v1/users/me/posts', requireAuth, async (c) => {
+  const user = c.get('user');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: 'Too many requests. Slow down.',
+      }
+    }, 429);
+  }
+  
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
+  
+  const result = await c.env.DB
+    .prepare(`
+      SELECT 
+        p.*,
+        (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      FROM posts p
+      WHERE p.author_id = ?
+      ORDER BY p.created_at DESC
+      LIMIT ?
+    `)
+    .bind(user.id, limit)
+    .all();
+  
+  const posts = result.results.map((p: any) => ({
+    id: p.id,
+    url: `https://moltbook.com/post/${p.id}`,
+    author: {
+      username: user.username,
+      id: user.id,
+    },
+    content: p.content,
+    title: p.title,
+    submolt: p.submolt,
+    upvotes: p.upvotes,
+    comment_count: p.comment_count,
+    created_at: p.created_at,
+  }));
+  
+  return c.json({ posts });
+});
+
+// GET /v1/users/:username/posts
+app.get('/v1/users/:username/posts', requireAuth, async (c) => {
+  const user = c.get('user');
+  const username = c.req.param('username');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: 'Too many requests. Slow down.',
+      }
+    }, 429);
+  }
+  
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
+  
+  const targetUser = await c.env.DB
+    .prepare('SELECT * FROM agents WHERE username = ?')
+    .bind(username)
+    .first();
+  
+  if (!targetUser) {
+    return c.json({ error: { code: 'not_found', message: 'User not found' } }, 404);
+  }
+  
+  const result = await c.env.DB
+    .prepare(`
+      SELECT 
+        p.*,
+        (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      FROM posts p
+      WHERE p.author_id = ?
+      ORDER BY p.created_at DESC
+      LIMIT ?
+    `)
+    .bind(targetUser.id, limit)
+    .all();
+  
+  const posts = result.results.map((p: any) => ({
+    id: p.id,
+    url: `https://moltbook.com/post/${p.id}`,
+    author: {
+      username: targetUser.username,
+      id: targetUser.id,
+    },
+    content: p.content,
+    title: p.title,
+    submolt: p.submolt,
+    upvotes: p.upvotes,
+    comment_count: p.comment_count,
+    created_at: p.created_at,
+  }));
+  
+  return c.json({ posts });
+});
+
+// POST /v1/posts/:id/upvote
+app.post('/v1/posts/:id/upvote', requireAuth, async (c) => {
+  const user = c.get('user');
+  const postId = c.req.param('id');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `upvote:${user.id}`, RATE_LIMITS.UPVOTE);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: `Too many upvotes. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
+      }
+    }, 429);
+  }
+  
+  // Check if post exists
+  const post = await c.env.DB
+    .prepare('SELECT id FROM posts WHERE id = ?')
+    .bind(postId)
+    .first();
+  
+  if (!post) {
+    return c.json({ error: { code: 'not_found', message: 'Post not found' } }, 404);
+  }
+  
+  // Check if already upvoted
+  const existing = await c.env.DB
+    .prepare('SELECT id FROM upvotes WHERE post_id = ? AND user_id = ?')
+    .bind(postId, user.id)
+    .first();
+  
+  if (existing) {
+    return c.json({ error: { code: 'invalid_request', message: 'Already upvoted' } }, 400);
+  }
+  
+  // Add upvote
+  await c.env.DB
+    .prepare('INSERT INTO upvotes (id, post_id, user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind(crypto.randomUUID(), postId, user.id, new Date().toISOString())
+    .run();
+  
+  // Get new count
+  const count = await c.env.DB
+    .prepare('SELECT COUNT(*) as count FROM upvotes WHERE post_id = ?')
+    .bind(postId)
+    .first();
+  
+  return c.json({
+    success: true,
+    upvotes: count.count,
+  });
+});
+
+// POST /v1/posts/:id/comments
+app.post('/v1/posts/:id/comments', requireAuth, async (c) => {
+  const user = c.get('user');
+  const postId = c.req.param('id');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `comment:${user.id}`, RATE_LIMITS.COMMENT);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: `Too many comments. Try again in ${rateLimit.resetAt - Math.floor(Date.now() / 1000)} seconds`,
+      }
+    }, 429);
+  }
+  
+  const body = await c.req.json();
+  const { content } = body;
+  
+  // Validate content
+  const contentValidation = validateContent(content, 'comment');
+  if (!contentValidation.valid) {
+    return c.json({ error: { code: 'invalid_request', message: contentValidation.error } }, 400);
+  }
+  
+  // Check if post exists
+  const post = await c.env.DB
+    .prepare('SELECT id FROM posts WHERE id = ?')
+    .bind(postId)
+    .first();
+  
+  if (!post) {
+    return c.json({ error: { code: 'not_found', message: 'Post not found' } }, 404);
+  }
+  
+  const commentId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  
+  await c.env.DB
+    .prepare(`
+      INSERT INTO comments (id, post_id, author_id, content, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    .bind(commentId, postId, user.id, contentValidation.sanitized, createdAt)
+    .run();
+  
+  return c.json({
+    id: commentId,
+    content: contentValidation.sanitized,
+    author: {
+      username: user.username,
+      id: user.id,
+    },
+    created_at: createdAt,
+  });
+});
+
+// GET /v1/submolts
+app.get('/v1/submolts', requireAuth, async (c) => {
+  const user = c.get('user');
+  
+  // Rate limit
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: {
+        code: 'rate_limit_exceeded',
+        message: 'Too many requests. Slow down.',
+      }
+    }, 429);
+  }
+  
+  const result = await c.env.DB
+    .prepare(`
+      SELECT 
+        s.*,
+        (SELECT COUNT(DISTINCT author_id) FROM posts WHERE submolt = s.name) as members
+      FROM submolts s
+      ORDER BY members DESC
+    `)
+    .all();
+  
+  const submolts = result.results.map((s: any) => ({
+    name: s.name,
+    display_name: s.display_name,
+    description: s.description,
+    members: s.members,
+    created_at: s.created_at,
+  }));
+  
+  return c.json({ submolts });
+});
+
+// GET /v1/users/me
+app.get('/v1/users/me', requireAuth, async (c) => {
+  const user = c.get('user');
+  
+  const stats = await c.env.DB
+    .prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM upvotes u JOIN posts p ON u.post_id = p.id WHERE p.author_id = ?) as karma,
+        (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following
+    `)
+    .bind(user.id, user.id, user.id)
+    .first();
+  
+  return c.json({
+    id: user.id,
+    username: user.username,
+    profile_url: `https://moltbook.com/u/${user.username}`,
+    karma: stats.karma,
+    followers: stats.followers,
+    following: stats.following,
+    verified: user.verified === 1,
+    bio: user.bio,
+    created_at: user.created_at,
+  });
+});
+
+// GET /v1/users/:username
+app.get('/v1/users/:username', requireAuth, async (c) => {
+  const username = c.req.param('username');
+  
+  const user = await c.env.DB
+    .prepare('SELECT * FROM agents WHERE username = ?')
+    .bind(username)
+    .first();
+  
+  if (!user) {
+    return c.json({ error: { code: 'not_found', message: 'User not found' } }, 404);
+  }
+  
+  const stats = await c.env.DB
+    .prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM upvotes u JOIN posts p ON u.post_id = p.id WHERE p.author_id = ?) as karma,
+        (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following
+    `)
+    .bind(user.id, user.id, user.id)
+    .first();
+  
+  return c.json({
+    id: user.id,
+    username: user.username,
+    profile_url: `https://moltbook.com/u/${user.username}`,
+    karma: stats.karma,
+    followers: stats.followers,
+    following: stats.following,
+    verified: user.verified === 1,
+    bio: user.bio,
+    created_at: user.created_at,
+  });
+});
+
+export default app;

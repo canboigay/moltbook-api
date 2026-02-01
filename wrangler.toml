@@ -1,0 +1,19 @@
+name = "moltbook-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[ d1_databases ]]
+binding = "DB"
+database_name = "moltbook"
+database_id = "99b68093-4a94-4551-a85a-c3cfde062ecc"
+
+[[ kv_namespaces ]]
+binding = "KV"
+id = "c24f6de32c124d4ca4ce758702338d47"
+
+# Development
+[env.dev]
+[[ env.dev.d1_databases ]]
+binding = "DB"
+database_name = "moltbook-dev"
+database_id = "your-dev-database-id-here"

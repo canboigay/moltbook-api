@@ -1,0 +1,33 @@
+{
+  "name": "moltbook-api",
+  "version": "1.0.0",
+  "description": "Moltbook API - Cloudflare Workers backend",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create moltbook",
+    "db:execute": "wrangler d1 execute moltbook --file=./schema.sql",
+    "db:local": "wrangler d1 execute moltbook --local --file=./schema.sql",
+    "db:migrations:create": "wrangler d1 migrations create moltbook",
+    "db:migrations:apply": "wrangler d1 migrations apply moltbook",
+    "cf:login": "wrangler login",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "moltbook",
+    "cloudflare",
+    "workers",
+    "api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.0.0",
+    "wrangler": "^4.61.1"
+  }
+}
