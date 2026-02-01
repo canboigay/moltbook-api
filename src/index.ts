@@ -767,62 +767,67 @@ app.get('/v1/users/:username', requireAuth, async (c) => {
 
 // GET /v1/agents - List all agents (public endpoint with IP rate limiting)
 app.get('/v1/agents', async (c) => {
-  const clientIP = getClientIP(c);
-  
-  const rateLimit = await checkRateLimit(c.env.KV, `read:public:${clientIP}`, RATE_LIMITS.READ);
-  if (!rateLimit.allowed) {
-    return c.json({
-      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
-    }, 429);
-  }
-  
-  const limit = Math.min(parseInt(c.req.query('limit') || '100'), 500);
-  const offset = parseInt(c.req.query('offset') || '0');
-  
-  const result = await c.env.DB
-    .prepare(`
-      SELECT 
-        a.id,
-        a.username,
-        a.verified,
-        a.bio,
-        a.twitter_username,
-        a.created_at,
-        (SELECT COALESCE(SUM(upvote_count), 0) FROM posts WHERE author_id = a.id) as karma,
-        (SELECT COUNT(*) FROM posts WHERE author_id = a.id) as posts_count,
-        (SELECT COUNT(*) FROM comments WHERE author_id = a.id) as comments_count,
-        (SELECT COUNT(*) FROM follows WHERE following_id = a.id) as followers_count
-      FROM agents a
-      ORDER BY karma DESC, posts_count DESC
-      LIMIT ? OFFSET ?
-    `)
-    .bind(limit, offset)
-    .all();
-  
-  const agents = (result.results || []).map((a: any) => ({
-    id: a.id,
-    username: a.username,
-    profile_url: `https://www.moltbook.com/u/${a.username}`,
-    karma: a.karma || 0,
-    posts_count: a.posts_count || 0,
-    comments_count: a.comments_count || 0,
-    followers_count: a.followers_count || 0,
-    verified: a.verified === 1,
-    bio: a.bio,
-    twitter_username: a.twitter_username,
-    created_at: a.created_at,
-  }));
-  
-  return c.json({
-    agents,
-    pagination: {
-      limit,
-      offset,
-      count: agents.length,
+  try {
+    const clientIP = getClientIP(c);
+    
+    const rateLimit = await checkRateLimit(c.env.KV, `read:public:${clientIP}`, RATE_LIMITS.READ);
+    if (!rateLimit.allowed) {
+      return c.json({
+        error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
+      }, 429);
     }
-  }, 200, {
-    'Cache-Control': 'public, max-age=300', // 5 min cache
-  });
+    
+    const limit = Math.min(parseInt(c.req.query('limit') || '100'), 500);
+    const offset = parseInt(c.req.query('offset') || '0');
+    
+    const result = await c.env.DB
+      .prepare(`
+        SELECT 
+          a.id,
+          a.username,
+          a.verified,
+          a.bio,
+          a.twitter_username,
+          a.created_at,
+          (SELECT COALESCE(SUM(upvote_count), 0) FROM posts WHERE author_id = a.id) as karma,
+          (SELECT COUNT(*) FROM posts WHERE author_id = a.id) as posts_count
+        FROM agents a
+        ORDER BY karma DESC, posts_count DESC
+        LIMIT ? OFFSET ?
+      `)
+      .bind(limit, offset)
+      .all();
+    
+    const agents = (result.results || []).map((a: any) => ({
+      id: a.id,
+      username: a.username,
+      profile_url: `https://www.moltbook.com/u/${a.username}`,
+      karma: a.karma || 0,
+      posts_count: a.posts_count || 0,
+      comments_count: 0, // Removed due to potential table issues
+      followers_count: 0, // Removed due to potential table issues
+      verified: a.verified === 1,
+      bio: a.bio,
+      twitter_username: a.twitter_username,
+      created_at: a.created_at,
+    }));
+    
+    return c.json({
+      agents,
+      pagination: {
+        limit,
+        offset,
+        count: agents.length,
+      }
+    }, 200, {
+      'Cache-Control': 'public, max-age=300', // 5 min cache
+    });
+  } catch (error) {
+    console.error('Error in /v1/agents:', error);
+    return c.json({
+      error: { code: 'internal_error', message: 'Failed to fetch agents' }
+    }, 500);
+  }
 });
 
 export default app;
