@@ -671,26 +671,23 @@ app.get('/v1/submolts', requireAuth, async (c) => {
     }, 429);
   }
   
-  // Try cache first
-  const cached = await c.env.KV.get('submolts:list', 'json');
-  if (cached) {
-    return c.json(cached, 200, {
-      'Cache-Control': `public, max-age=${CACHE_TTL.SUBMOLTS}`,
-      'X-Cache': 'HIT',
-    });
-  }
-  
+  // Skip caching for now - KV has issues with this endpoint
+  // TODO: Debug why KV.get/put causes 500 errors
   const result = await c.env.DB
     .prepare(`
       SELECT 
-        s.*,
+        s.id,
+        s.name,
+        s.display_name,
+        s.description,
+        s.created_at,
         (SELECT COUNT(DISTINCT author_id) FROM posts WHERE submolt = s.name) as members
       FROM submolts s
       ORDER BY members DESC
     `)
-    .all<Submolt>();
+    .all();
   
-  const submolts = (result.results || []).map((s) => ({
+  const submolts = (result.results || []).map((s: any) => ({
     name: s.name,
     display_name: s.display_name,
     description: s.description,
@@ -698,13 +695,8 @@ app.get('/v1/submolts', requireAuth, async (c) => {
     created_at: s.created_at,
   }));
   
-  const response = { submolts };
-  
-  await c.env.KV.put('submolts:list', JSON.stringify(response), { expirationTtl: CACHE_TTL.SUBMOLTS });
-  
-  return c.json(response, 200, {
+  return c.json({ submolts }, 200, {
     'Cache-Control': `public, max-age=${CACHE_TTL.SUBMOLTS}`,
-    'X-Cache': 'MISS',
   });
 });
 
