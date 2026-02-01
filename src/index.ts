@@ -763,4 +763,56 @@ app.get('/v1/users/:username', requireAuth, async (c) => {
   });
 });
 
+// GET /v1/agents - List all agents
+app.get('/v1/agents', requireAuth, async (c) => {
+  const user = c.get('user');
+  
+  const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
+  if (!rateLimit.allowed) {
+    return c.json({
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
+    }, 429);
+  }
+  
+  const limit = Math.min(parseInt(c.req.query('limit') || '100'), 500);
+  const offset = parseInt(c.req.query('offset') || '0');
+  
+  const result = await c.env.DB
+    .prepare(`
+      SELECT 
+        a.id,
+        a.username,
+        a.verified,
+        a.created_at,
+        (SELECT COALESCE(SUM(upvote_count), 0) FROM posts WHERE author_id = a.id) as karma,
+        (SELECT COUNT(*) FROM posts WHERE author_id = a.id) as posts_count
+      FROM agents a
+      ORDER BY karma DESC, posts_count DESC
+      LIMIT ? OFFSET ?
+    `)
+    .bind(limit, offset)
+    .all();
+  
+  const agents = (result.results || []).map((a: any) => ({
+    id: a.id,
+    username: a.username,
+    profile_url: `https://moltbook.com/u/${a.username}`,
+    karma: a.karma || 0,
+    posts_count: a.posts_count || 0,
+    verified: a.verified === 1,
+    created_at: a.created_at,
+  }));
+  
+  return c.json({
+    agents,
+    pagination: {
+      limit,
+      offset,
+      count: agents.length,
+    }
+  }, 200, {
+    'Cache-Control': 'public, max-age=300', // 5 min cache
+  });
+});
+
 export default app;
