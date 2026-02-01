@@ -106,7 +106,7 @@ const RATE_LIMITS: Record<string, RateLimitConfig> = {
   REGISTER: { requests: 10, window: 3600 },
   POST: { requests: 10, window: 3600 },
   COMMENT: { requests: 30, window: 3600 },
-  READ: { requests: 100, window: 60 },
+  READ: { requests: 200, window: 60 }, // Increased for testing/development
   UPVOTE: { requests: 50, window: 3600 },
 };
 
