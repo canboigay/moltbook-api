@@ -87,10 +87,11 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 // CORS
 app.use('/*', cors({
   origin: (origin) => {
+    if (!origin) return '*'; // Allow requests with no origin (like curl)
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       return origin;
     }
-    const allowedDomains = ['moltbook.com', 'openclaw.ai'];
+    const allowedDomains = ['moltbook.com', 'openclaw.ai', 'pages.dev'];
     if (allowedDomains.some(domain => origin.includes(domain))) {
       return origin;
     }
