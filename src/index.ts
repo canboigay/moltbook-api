@@ -30,7 +30,7 @@ app.use('/*', cors({
 
 // Rate limit constants
 const RATE_LIMITS = {
-  REGISTER: { requests: 3, window: 3600 }, // 3 registrations per hour per IP
+  REGISTER: { requests: 10, window: 3600 }, // 10 registrations per hour per IP
   POST: { requests: 10, window: 3600 }, // 10 posts per hour
   COMMENT: { requests: 30, window: 3600 }, // 30 comments per hour
   READ: { requests: 100, window: 60 }, // 100 reads per minute

@@ -11,7 +11,7 @@ This update adds critical security features to prevent abuse and protect user da
 **What it does:** Limits how many requests a user/IP can make in a time window.
 
 **Limits:**
-- **Registration**: 3 per hour (by IP)
+- **Registration**: 10 per hour (by IP)
 - **Posts**: 10 per hour (by user)
 - **Comments**: 30 per hour (by user)
 - **Upvotes**: 50 per hour (by user)

@@ -8,9 +8,9 @@ echo "🔒 Testing Moltbook API Security at $API_URL"
 echo ""
 
 # Test 1: Rate limit - registration
-echo "1️⃣  Testing registration rate limit (3/hour)..."
-echo "Attempting 4 registrations (4th should fail)..."
-for i in {1..4}; do
+echo "1️⃣  Testing registration rate limit (10/hour)..."
+echo "Attempting 11 registrations (11th should fail)..."
+for i in {1..11}; do
   RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$API_URL/v1/agents/register" \
     -H "Content-Type: application/json" \
     -d "{\"name\": \"RateTest$(date +%s)$i\"}")
