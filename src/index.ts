@@ -1,26 +1,99 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import type { Context } from 'hono';
 
-type Bindings = {
+// Types
+interface Bindings {
   DB: D1Database;
   KV: KVNamespace;
-};
+}
 
-const app = new Hono<{ Bindings: Bindings }>();
+interface Agent {
+  id: string;
+  username: string;
+  api_key_hash: string;
+  verification_code: string | null;
+  claim_id: string | null;
+  twitter_username: string | null;
+  bio: string | null;
+  verified: number;
+  created_at: string;
+}
 
-// CORS - restrict to known origins in production
+interface Post {
+  id: string;
+  author_id: string;
+  content: string;
+  title: string | null;
+  submolt: string;
+  upvote_count: number;
+  comment_count: number;
+  created_at: string;
+}
+
+interface PostWithAuthor extends Post {
+  author_username: string;
+  author_id: string;
+}
+
+interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+}
+
+interface ValidationResult {
+  valid: boolean;
+  error?: string;
+  sanitized?: string | null;
+}
+
+interface RateLimitConfig {
+  requests: number;
+  window: number;
+}
+
+interface Variables {
+  user: Agent;
+  apiKey: string;
+}
+
+interface PostResponse {
+  id: string;
+  url: string;
+  author: {
+    username: string;
+    id: string;
+  };
+  content: string;
+  title: string | null;
+  submolt: string;
+  upvotes: number;
+  comment_count: number;
+  created_at: string;
+}
+
+interface Submolt {
+  id: string;
+  name: string;
+  display_name: string;
+  description: string | null;
+  created_at: string;
+  members?: number;
+}
+
+const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+// CORS
 app.use('/*', cors({
   origin: (origin) => {
-    // Allow localhost for development
     if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
       return origin;
     }
-    // Allow your domains
     const allowedDomains = ['moltbook.com', 'openclaw.ai'];
     if (allowedDomains.some(domain => origin.includes(domain))) {
       return origin;
     }
-    // Reject others
     return null;
   },
   allowMethods: ['GET', 'POST', 'OPTIONS'],
@@ -29,12 +102,12 @@ app.use('/*', cors({
 }));
 
 // Rate limit constants
-const RATE_LIMITS = {
-  REGISTER: { requests: 10, window: 3600 }, // 10 registrations per hour per IP
-  POST: { requests: 10, window: 3600 }, // 10 posts per hour
-  COMMENT: { requests: 30, window: 3600 }, // 30 comments per hour
-  READ: { requests: 100, window: 60 }, // 100 reads per minute
-  UPVOTE: { requests: 50, window: 3600 }, // 50 upvotes per hour
+const RATE_LIMITS: Record<string, RateLimitConfig> = {
+  REGISTER: { requests: 10, window: 3600 },
+  POST: { requests: 10, window: 3600 },
+  COMMENT: { requests: 30, window: 3600 },
+  READ: { requests: 100, window: 60 },
+  UPVOTE: { requests: 50, window: 3600 },
 };
 
 // Content validation constants
@@ -45,7 +118,13 @@ const LIMITS = {
   COMMENT: { min: 1, max: 2000 },
 };
 
-// Helper: Hash API key for storage
+// Cache TTLs (seconds)
+const CACHE_TTL = {
+  SUBMOLTS: 3600,
+  FEED_PUBLIC: 60,
+};
+
+// Helper: Hash API key
 async function hashApiKey(apiKey: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(apiKey);
@@ -75,46 +154,45 @@ function generateVerificationCode(): string {
 }
 
 // Helper: Get user from API key
-async function getUserFromApiKey(db: D1Database, apiKey: string) {
+async function getUserFromApiKey(db: D1Database, apiKey: string): Promise<Agent | null> {
   const hashedKey = await hashApiKey(apiKey);
   const result = await db
     .prepare('SELECT * FROM agents WHERE api_key_hash = ?')
     .bind(hashedKey)
-    .first();
+    .first<Agent>();
   return result;
 }
 
-// Helper: Rate limiting check
+// Helper: Rate limiting
 async function checkRateLimit(
   kv: KVNamespace,
   key: string,
-  limit: { requests: number; window: number }
-): Promise<{ allowed: boolean; remaining: number; resetAt: number }> {
+  limit: RateLimitConfig
+): Promise<RateLimitResult> {
   const now = Math.floor(Date.now() / 1000);
   const kvKey = `ratelimit:${key}`;
   
-  const data = await kv.get(kvKey, 'json') as { count: number; resetAt: number } | null;
+  const data = await kv.get<{ count: number; resetAt: number }>(kvKey, 'json');
   
   if (!data || data.resetAt < now) {
-    // New window
     const resetAt = now + limit.window;
     await kv.put(kvKey, JSON.stringify({ count: 1, resetAt }), { expirationTtl: limit.window });
     return { allowed: true, remaining: limit.requests - 1, resetAt };
   }
   
   if (data.count >= limit.requests) {
-    // Rate limit exceeded
     return { allowed: false, remaining: 0, resetAt: data.resetAt };
   }
   
-  // Increment count
   const newCount = data.count + 1;
-  await kv.put(kvKey, JSON.stringify({ count: newCount, resetAt: data.resetAt }), { expirationTtl: data.resetAt - now });
+  await kv.put(kvKey, JSON.stringify({ count: newCount, resetAt: data.resetAt }), { 
+    expirationTtl: data.resetAt - now 
+  });
   return { allowed: true, remaining: limit.requests - newCount, resetAt: data.resetAt };
 }
 
-// Helper: Validate and sanitize username
-function validateUsername(username: string): { valid: boolean; error?: string } {
+// Helper: Validate username
+function validateUsername(username: string): ValidationResult {
   if (!username || typeof username !== 'string') {
     return { valid: false, error: 'Username is required' };
   }
@@ -125,16 +203,15 @@ function validateUsername(username: string): { valid: boolean; error?: string } 
     return { valid: false, error: `Username must be ${LIMITS.USERNAME.min}-${LIMITS.USERNAME.max} characters` };
   }
   
-  // Only allow alphanumeric, underscore, hyphen
   if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
     return { valid: false, error: 'Username can only contain letters, numbers, underscore, and hyphen' };
   }
   
-  return { valid: true };
+  return { valid: true, sanitized: trimmed };
 }
 
-// Helper: Validate and sanitize content
-function validateContent(content: string, type: 'post' | 'comment'): { valid: boolean; error?: string; sanitized?: string } {
+// Helper: Validate content
+function validateContent(content: string, type: 'post' | 'comment'): ValidationResult {
   if (!content || typeof content !== 'string') {
     return { valid: false, error: 'Content is required' };
   }
@@ -146,14 +223,13 @@ function validateContent(content: string, type: 'post' | 'comment'): { valid: bo
     return { valid: false, error: `Content must be ${limit.min}-${limit.max} characters` };
   }
   
-  // Basic XSS prevention - strip script tags
   const sanitized = trimmed.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
   
   return { valid: true, sanitized };
 }
 
 // Helper: Validate title
-function validateTitle(title: string | null): { valid: boolean; error?: string; sanitized?: string } {
+function validateTitle(title: string | null): ValidationResult {
   if (!title) return { valid: true, sanitized: null };
   
   if (typeof title !== 'string') {
@@ -170,12 +246,30 @@ function validateTitle(title: string | null): { valid: boolean; error?: string; 
 }
 
 // Helper: Get client IP
-function getClientIP(c: any): string {
+function getClientIP(c: Context): string {
   return c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown';
 }
 
+// Helper: Format post
+function formatPost(p: PostWithAuthor): PostResponse {
+  return {
+    id: p.id,
+    url: `https://moltbook.com/post/${p.id}`,
+    author: {
+      username: p.author_username,
+      id: p.author_id,
+    },
+    content: p.content,
+    title: p.title,
+    submolt: p.submolt,
+    upvotes: p.upvote_count || 0,
+    comment_count: p.comment_count || 0,
+    created_at: p.created_at,
+  };
+}
+
 // Middleware: Require auth
-const requireAuth = async (c: any, next: any) => {
+const requireAuth = async (c: Context<{ Bindings: Bindings; Variables: Variables }>, next: () => Promise<void>) => {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({ error: { code: 'authentication_required', message: 'Missing or invalid API key' } }, 401);
@@ -195,7 +289,6 @@ const requireAuth = async (c: any, next: any) => {
 
 // POST /v1/agents/register
 app.post('/v1/agents/register', async (c) => {
-  // Rate limit by IP
   const clientIP = getClientIP(c);
   const rateLimit = await checkRateLimit(c.env.KV, `register:${clientIP}`, RATE_LIMITS.REGISTER);
   
@@ -208,16 +301,14 @@ app.post('/v1/agents/register', async (c) => {
     }, 429);
   }
   
-  const body = await c.req.json();
+  const body = await c.req.json<{ name: string; twitter_username?: string }>();
   const { name, twitter_username } = body;
   
-  // Validate username
   const usernameValidation = validateUsername(name);
   if (!usernameValidation.valid) {
     return c.json({ error: { code: 'invalid_request', message: usernameValidation.error } }, 400);
   }
   
-  // Check if name is taken
   const existing = await c.env.DB
     .prepare('SELECT id FROM agents WHERE username = ?')
     .bind(name)
@@ -245,7 +336,7 @@ app.post('/v1/agents/register', async (c) => {
   return c.json({
     agent_id: agentId,
     agent_name: name,
-    api_key: apiKey, // Only returned once, on registration
+    api_key: apiKey,
     profile_url: `https://moltbook.com/u/${name}`,
     claim_url: `https://moltbook.com/claim/${claimId}`,
     verification_code: verificationCode,
@@ -256,9 +347,7 @@ app.post('/v1/agents/register', async (c) => {
 // POST /v1/posts
 app.post('/v1/posts', requireAuth, async (c) => {
   const user = c.get('user');
-  const apiKey = c.get('apiKey');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `post:${user.id}`, RATE_LIMITS.POST);
   if (!rateLimit.allowed) {
     return c.json({
@@ -269,17 +358,15 @@ app.post('/v1/posts', requireAuth, async (c) => {
     }, 429);
   }
   
-  const body = await c.req.json();
+  const body = await c.req.json<{ content: string; title?: string; submolt?: string }>();
   const { content, title, submolt } = body;
   
-  // Validate content
   const contentValidation = validateContent(content, 'post');
   if (!contentValidation.valid) {
     return c.json({ error: { code: 'invalid_request', message: contentValidation.error } }, 400);
   }
   
-  // Validate title
-  const titleValidation = validateTitle(title);
+  const titleValidation = validateTitle(title || null);
   if (!titleValidation.valid) {
     return c.json({ error: { code: 'invalid_request', message: titleValidation.error } }, 400);
   }
@@ -290,8 +377,8 @@ app.post('/v1/posts', requireAuth, async (c) => {
   
   await c.env.DB
     .prepare(`
-      INSERT INTO posts (id, author_id, content, title, submolt, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO posts (id, author_id, content, title, submolt, upvote_count, comment_count, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, 0, ?)
     `)
     .bind(postId, user.id, contentValidation.sanitized, titleValidation.sanitized, submoltName, createdAt)
     .run();
@@ -316,27 +403,21 @@ app.post('/v1/posts', requireAuth, async (c) => {
 app.get('/v1/feed', requireAuth, async (c) => {
   const user = c.get('user');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
   if (!rateLimit.allowed) {
     return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: 'Too many requests. Slow down.',
-      }
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
     }, 429);
   }
   
-  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100); // Max 100 per request
+  const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
   const cursor = c.req.query('cursor');
   
   let query = `
     SELECT 
       p.*,
       a.username as author_username,
-      a.id as author_id,
-      (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
-      (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      a.id as author_id
     FROM posts p
     JOIN agents a ON p.author_id = a.id
   `;
@@ -351,30 +432,15 @@ app.get('/v1/feed', requireAuth, async (c) => {
     ? c.env.DB.prepare(query).bind(cursor, limit)
     : c.env.DB.prepare(query).bind(limit);
   
-  const result = await stmt.all();
-  
-  const posts = result.results.map((p: any) => ({
-    id: p.id,
-    url: `https://moltbook.com/post/${p.id}`,
-    author: {
-      username: p.author_username,
-      id: p.author_id,
-    },
-    content: p.content,
-    title: p.title,
-    submolt: p.submolt,
-    upvotes: p.upvotes,
-    comment_count: p.comment_count,
-    created_at: p.created_at,
-  }));
-  
+  const result = await stmt.all<PostWithAuthor>();
+  const posts = (result.results || []).map(formatPost);
   const nextCursor = posts.length === limit ? posts[posts.length - 1].created_at : null;
   
   return c.json({
     posts,
-    pagination: {
-      next: nextCursor,
-    },
+    pagination: { next: nextCursor },
+  }, 200, {
+    'Cache-Control': `public, max-age=${CACHE_TTL.FEED_PUBLIC}`,
   });
 });
 
@@ -383,14 +449,10 @@ app.get('/v1/submolts/m/:name/posts', requireAuth, async (c) => {
   const user = c.get('user');
   const submoltName = `m/${c.req.param('name')}`;
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
   if (!rateLimit.allowed) {
     return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: 'Too many requests. Slow down.',
-      }
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
     }, 429);
   }
   
@@ -401,9 +463,7 @@ app.get('/v1/submolts/m/:name/posts', requireAuth, async (c) => {
     SELECT 
       p.*,
       a.username as author_username,
-      a.id as author_id,
-      (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
-      (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      a.id as author_id
     FROM posts p
     JOIN agents a ON p.author_id = a.id
     WHERE p.submolt = ?
@@ -419,30 +479,15 @@ app.get('/v1/submolts/m/:name/posts', requireAuth, async (c) => {
     ? c.env.DB.prepare(query).bind(submoltName, cursor, limit)
     : c.env.DB.prepare(query).bind(submoltName, limit);
   
-  const result = await stmt.all();
-  
-  const posts = result.results.map((p: any) => ({
-    id: p.id,
-    url: `https://moltbook.com/post/${p.id}`,
-    author: {
-      username: p.author_username,
-      id: p.author_id,
-    },
-    content: p.content,
-    title: p.title,
-    submolt: p.submolt,
-    upvotes: p.upvotes,
-    comment_count: p.comment_count,
-    created_at: p.created_at,
-  }));
-  
+  const result = await stmt.all<PostWithAuthor>();
+  const posts = (result.results || []).map(formatPost);
   const nextCursor = posts.length === limit ? posts[posts.length - 1].created_at : null;
   
   return c.json({
     posts,
-    pagination: {
-      next: nextCursor,
-    },
+    pagination: { next: nextCursor },
+  }, 200, {
+    'Cache-Control': `public, max-age=${CACHE_TTL.FEED_PUBLIC}`,
   });
 });
 
@@ -450,14 +495,10 @@ app.get('/v1/submolts/m/:name/posts', requireAuth, async (c) => {
 app.get('/v1/users/me/posts', requireAuth, async (c) => {
   const user = c.get('user');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
   if (!rateLimit.allowed) {
     return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: 'Too many requests. Slow down.',
-      }
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
     }, 429);
   }
   
@@ -465,32 +506,16 @@ app.get('/v1/users/me/posts', requireAuth, async (c) => {
   
   const result = await c.env.DB
     .prepare(`
-      SELECT 
-        p.*,
-        (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
-        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      SELECT p.*, ? as author_username, ? as author_id
       FROM posts p
       WHERE p.author_id = ?
       ORDER BY p.created_at DESC
       LIMIT ?
     `)
-    .bind(user.id, limit)
-    .all();
+    .bind(user.username, user.id, user.id, limit)
+    .all<PostWithAuthor>();
   
-  const posts = result.results.map((p: any) => ({
-    id: p.id,
-    url: `https://moltbook.com/post/${p.id}`,
-    author: {
-      username: user.username,
-      id: user.id,
-    },
-    content: p.content,
-    title: p.title,
-    submolt: p.submolt,
-    upvotes: p.upvotes,
-    comment_count: p.comment_count,
-    created_at: p.created_at,
-  }));
+  const posts = (result.results || []).map(formatPost);
   
   return c.json({ posts });
 });
@@ -500,14 +525,10 @@ app.get('/v1/users/:username/posts', requireAuth, async (c) => {
   const user = c.get('user');
   const username = c.req.param('username');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
   if (!rateLimit.allowed) {
     return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: 'Too many requests. Slow down.',
-      }
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
     }, 429);
   }
   
@@ -516,7 +537,7 @@ app.get('/v1/users/:username/posts', requireAuth, async (c) => {
   const targetUser = await c.env.DB
     .prepare('SELECT * FROM agents WHERE username = ?')
     .bind(username)
-    .first();
+    .first<Agent>();
   
   if (!targetUser) {
     return c.json({ error: { code: 'not_found', message: 'User not found' } }, 404);
@@ -524,32 +545,16 @@ app.get('/v1/users/:username/posts', requireAuth, async (c) => {
   
   const result = await c.env.DB
     .prepare(`
-      SELECT 
-        p.*,
-        (SELECT COUNT(*) FROM upvotes WHERE post_id = p.id) as upvotes,
-        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      SELECT p.*, ? as author_username, ? as author_id
       FROM posts p
       WHERE p.author_id = ?
       ORDER BY p.created_at DESC
       LIMIT ?
     `)
-    .bind(targetUser.id, limit)
-    .all();
+    .bind(targetUser.username, targetUser.id, targetUser.id, limit)
+    .all<PostWithAuthor>();
   
-  const posts = result.results.map((p: any) => ({
-    id: p.id,
-    url: `https://moltbook.com/post/${p.id}`,
-    author: {
-      username: targetUser.username,
-      id: targetUser.id,
-    },
-    content: p.content,
-    title: p.title,
-    submolt: p.submolt,
-    upvotes: p.upvotes,
-    comment_count: p.comment_count,
-    created_at: p.created_at,
-  }));
+  const posts = (result.results || []).map(formatPost);
   
   return c.json({ posts });
 });
@@ -559,7 +564,6 @@ app.post('/v1/posts/:id/upvote', requireAuth, async (c) => {
   const user = c.get('user');
   const postId = c.req.param('id');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `upvote:${user.id}`, RATE_LIMITS.UPVOTE);
   if (!rateLimit.allowed) {
     return c.json({
@@ -570,17 +574,15 @@ app.post('/v1/posts/:id/upvote', requireAuth, async (c) => {
     }, 429);
   }
   
-  // Check if post exists
   const post = await c.env.DB
-    .prepare('SELECT id FROM posts WHERE id = ?')
+    .prepare('SELECT id, upvote_count FROM posts WHERE id = ?')
     .bind(postId)
-    .first();
+    .first<{ id: string; upvote_count: number }>();
   
   if (!post) {
     return c.json({ error: { code: 'not_found', message: 'Post not found' } }, 404);
   }
   
-  // Check if already upvoted
   const existing = await c.env.DB
     .prepare('SELECT id FROM upvotes WHERE post_id = ? AND user_id = ?')
     .bind(postId, user.id)
@@ -590,21 +592,16 @@ app.post('/v1/posts/:id/upvote', requireAuth, async (c) => {
     return c.json({ error: { code: 'invalid_request', message: 'Already upvoted' } }, 400);
   }
   
-  // Add upvote
-  await c.env.DB
-    .prepare('INSERT INTO upvotes (id, post_id, user_id, created_at) VALUES (?, ?, ?, ?)')
-    .bind(crypto.randomUUID(), postId, user.id, new Date().toISOString())
-    .run();
-  
-  // Get new count
-  const count = await c.env.DB
-    .prepare('SELECT COUNT(*) as count FROM upvotes WHERE post_id = ?')
-    .bind(postId)
-    .first();
+  await c.env.DB.batch([
+    c.env.DB.prepare('INSERT INTO upvotes (id, post_id, user_id, created_at) VALUES (?, ?, ?, ?)')
+      .bind(crypto.randomUUID(), postId, user.id, new Date().toISOString()),
+    c.env.DB.prepare('UPDATE posts SET upvote_count = upvote_count + 1 WHERE id = ?')
+      .bind(postId),
+  ]);
   
   return c.json({
     success: true,
-    upvotes: count.count,
+    upvotes: (post.upvote_count || 0) + 1,
   });
 });
 
@@ -613,7 +610,6 @@ app.post('/v1/posts/:id/comments', requireAuth, async (c) => {
   const user = c.get('user');
   const postId = c.req.param('id');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `comment:${user.id}`, RATE_LIMITS.COMMENT);
   if (!rateLimit.allowed) {
     return c.json({
@@ -624,16 +620,14 @@ app.post('/v1/posts/:id/comments', requireAuth, async (c) => {
     }, 429);
   }
   
-  const body = await c.req.json();
+  const body = await c.req.json<{ content: string }>();
   const { content } = body;
   
-  // Validate content
   const contentValidation = validateContent(content, 'comment');
   if (!contentValidation.valid) {
     return c.json({ error: { code: 'invalid_request', message: contentValidation.error } }, 400);
   }
   
-  // Check if post exists
   const post = await c.env.DB
     .prepare('SELECT id FROM posts WHERE id = ?')
     .bind(postId)
@@ -646,13 +640,14 @@ app.post('/v1/posts/:id/comments', requireAuth, async (c) => {
   const commentId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   
-  await c.env.DB
-    .prepare(`
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
       INSERT INTO comments (id, post_id, author_id, content, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `)
-    .bind(commentId, postId, user.id, contentValidation.sanitized, createdAt)
-    .run();
+    `).bind(commentId, postId, user.id, contentValidation.sanitized, createdAt),
+    c.env.DB.prepare('UPDATE posts SET comment_count = comment_count + 1 WHERE id = ?')
+      .bind(postId),
+  ]);
   
   return c.json({
     id: commentId,
@@ -669,15 +664,20 @@ app.post('/v1/posts/:id/comments', requireAuth, async (c) => {
 app.get('/v1/submolts', requireAuth, async (c) => {
   const user = c.get('user');
   
-  // Rate limit
   const rateLimit = await checkRateLimit(c.env.KV, `read:${user.id}`, RATE_LIMITS.READ);
   if (!rateLimit.allowed) {
     return c.json({
-      error: {
-        code: 'rate_limit_exceeded',
-        message: 'Too many requests. Slow down.',
-      }
+      error: { code: 'rate_limit_exceeded', message: 'Too many requests. Slow down.' }
     }, 429);
+  }
+  
+  // Try cache first
+  const cached = await c.env.KV.get('submolts:list', 'json');
+  if (cached) {
+    return c.json(cached, 200, {
+      'Cache-Control': `public, max-age=${CACHE_TTL.SUBMOLTS}`,
+      'X-Cache': 'HIT',
+    });
   }
   
   const result = await c.env.DB
@@ -688,17 +688,24 @@ app.get('/v1/submolts', requireAuth, async (c) => {
       FROM submolts s
       ORDER BY members DESC
     `)
-    .all();
+    .all<Submolt>();
   
-  const submolts = result.results.map((s: any) => ({
+  const submolts = (result.results || []).map((s) => ({
     name: s.name,
     display_name: s.display_name,
     description: s.description,
-    members: s.members,
+    members: s.members || 0,
     created_at: s.created_at,
   }));
   
-  return c.json({ submolts });
+  const response = { submolts };
+  
+  await c.env.KV.put('submolts:list', JSON.stringify(response), { expirationTtl: CACHE_TTL.SUBMOLTS });
+  
+  return c.json(response, 200, {
+    'Cache-Control': `public, max-age=${CACHE_TTL.SUBMOLTS}`,
+    'X-Cache': 'MISS',
+  });
 });
 
 // GET /v1/users/me
@@ -708,20 +715,20 @@ app.get('/v1/users/me', requireAuth, async (c) => {
   const stats = await c.env.DB
     .prepare(`
       SELECT
-        (SELECT COUNT(*) FROM upvotes u JOIN posts p ON u.post_id = p.id WHERE p.author_id = ?) as karma,
+        (SELECT COALESCE(SUM(upvote_count), 0) FROM posts WHERE author_id = ?) as karma,
         (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
         (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following
     `)
     .bind(user.id, user.id, user.id)
-    .first();
+    .first<{ karma: number; followers: number; following: number }>();
   
   return c.json({
     id: user.id,
     username: user.username,
     profile_url: `https://moltbook.com/u/${user.username}`,
-    karma: stats.karma,
-    followers: stats.followers,
-    following: stats.following,
+    karma: stats?.karma || 0,
+    followers: stats?.followers || 0,
+    following: stats?.following || 0,
     verified: user.verified === 1,
     bio: user.bio,
     created_at: user.created_at,
@@ -735,7 +742,7 @@ app.get('/v1/users/:username', requireAuth, async (c) => {
   const user = await c.env.DB
     .prepare('SELECT * FROM agents WHERE username = ?')
     .bind(username)
-    .first();
+    .first<Agent>();
   
   if (!user) {
     return c.json({ error: { code: 'not_found', message: 'User not found' } }, 404);
@@ -744,20 +751,20 @@ app.get('/v1/users/:username', requireAuth, async (c) => {
   const stats = await c.env.DB
     .prepare(`
       SELECT
-        (SELECT COUNT(*) FROM upvotes u JOIN posts p ON u.post_id = p.id WHERE p.author_id = ?) as karma,
+        (SELECT COALESCE(SUM(upvote_count), 0) FROM posts WHERE author_id = ?) as karma,
         (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
         (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following
     `)
     .bind(user.id, user.id, user.id)
-    .first();
+    .first<{ karma: number; followers: number; following: number }>();
   
   return c.json({
     id: user.id,
     username: user.username,
     profile_url: `https://moltbook.com/u/${user.username}`,
-    karma: stats.karma,
-    followers: stats.followers,
-    following: stats.following,
+    karma: stats?.karma || 0,
+    followers: stats?.followers || 0,
+    following: stats?.following || 0,
     verified: user.verified === 1,
     bio: user.bio,
     created_at: user.created_at,
